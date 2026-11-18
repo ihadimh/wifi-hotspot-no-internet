@@ -1,4 +1,4 @@
-# Wi-Fi 已连接但无法上网：ARP 表为空时的分层排查
+﻿# Wi-Fi 已连接但无法上网：ARP 表为空时的分层排查
 
 > 电脑连手机热点显示「已连接」，但无 Internet；接口有 IP 地址，ARP 表却是空的。
 > 本文只记录实测数据与由数据直接得出的推断，未经验证的内容标注为「候选原因」。
@@ -18,7 +18,14 @@ Measured facts:
 
 A natural contrast appeared later: when the cached lease had **expired** (event `50076`), Windows was forced to run a full DHCP exchange — and the connection worked immediately (ARP resolved, 0% loss, HTTP 200). When the cached lease was **still valid**, the connection failed.
 
-**What this article does not claim:** a confirmed root cause. Three candidates are listed with supporting and contradicting evidence — (1) cached address conflicting with the hotspot's re-initialised DHCP pool, (2) mismatched PTK at the key layer, (3) a DHCP client stuck in a bad state. Discriminating steps are given in section 7.
+**What this article does not claim:** a confirmed root cause for the "connected but no traffic" half. Three candidates are listed with supporting and contradicting evidence — (1) cached address conflicting with the hotspot's re-initialised DHCP pool, (2) mismatched PTK at the key layer, (3) a DHCP client stuck in a bad state. Discriminating steps are given in section 8.
+
+**The periodic-disconnect half is now explained** (section 6). Later recurrences produced two distinct signatures:
+
+- `NCSI 4042` with reason `ActiveHttpProbeFailedButDnsSucceeded` → Windows drops the interface's "Internet" capability → `WLAN-AutoConfig 4003` "restricted connectivity, attempting auto-recovery" → `Netwtw 8000` **Miniport Halt** → the link dies and the driver re-initialises. Over three days NCSI flipped the capability 10 times on and 16 times off; `curl` to the probe URL succeeded 5/5, so the probe fails intermittently rather than being blocked.
+- Disconnects with **no** `4003`/`8000` at all — the driver simply drops the link, most likely because the phone stopped beaconing (screen-off power saving). These arrived 16-18 minutes after connecting.
+
+Workaround for the first path: set `EnableActiveProbing=0` under `HKLM\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters\Internet` and restart `NlaSvc`. Trade-off: Windows may keep showing "Connected" during a real outage. Fully reversible.
 
 Deleting and re-creating the Wi-Fi profile restored connectivity in this incident, but that action also discards the cached lease, resets the interface and forces a full handshake — so it cannot be used to prove which candidate is correct.
 
@@ -31,13 +38,14 @@ Deleting and re-creating the Wi-Fi profile restored connectivity in this inciden
 - [3. 故障状态下的实测数据](#3-故障状态下的实测数据)
 - [4. 一次天然对照：缓存过期后反而成功了](#4-一次天然对照缓存过期后反而成功了)
 - [5. 三种候选原因](#5-三种候选原因)
-- [6. 已验证有效的手段及其局限](#6-已验证有效的手段及其局限)
-- [7. 下次复发时的判定步骤](#7-下次复发时的判定步骤)
-- [8. 另一件独立的事：第一跳 30% 丢包](#8-另一件独立的事第一跳-30-丢包)
-- [9. 排查中做过但无效的操作](#9-排查中做过但无效的操作)
-- [10. 可复用的诊断清单](#10-可复用的诊断清单)
-- [11. 结论](#11-结论)
-- [12. 脚本](#12-脚本)
+- [6. 后续两次复发：断线机制得到解释](#6-后续两次复发断线机制得到解释)
+- [7. 已验证有效的手段及其局限](#7-已验证有效的手段及其局限)
+- [8. 下次复发时的判定步骤](#8-下次复发时的判定步骤)
+- [9. 另一件独立的事：第一跳 30% 丢包](#9-另一件独立的事第一跳-30-丢包)
+- [10. 排查中做过但无效的操作](#10-排查中做过但无效的操作)
+- [11. 可复用的诊断清单](#11-可复用的诊断清单)
+- [12. 结论](#12-结论)
+- [13. 脚本](#13-脚本)
 
 ---
 
@@ -149,7 +157,7 @@ ARP             : 192.168.96.146 -> 32-03-7e-cb-1a-df  动态
 
 ## 5. 三种候选原因
 
-三种解释都能覆盖观测到的现象，均未被证实。列出是为了说明下一步测什么。
+三种解释都能覆盖「关联成功、有 IP，却完全不通」这一半现象；**周期性掉线**那一半已在第 6 节拿到明确机制，不再属于候选。三种候选均未被证实，列出是为了说明下一步测什么。
 
 ### 候选一：缓存地址与热点重启后的实际分配冲突
 
@@ -172,7 +180,86 @@ ARP             : 192.168.96.146 -> 32-03-7e-cb-1a-df  动态
 - 支持：当天 5 次续订超时；同一时段校园网也出现加载困难。
 - 反对：无法解释 ARP 表为空——ARP 不依赖 DHCP 客户端状态。
 
-## 6. 已验证有效的手段及其局限
+## 6. 后续两次复发：断线机制得到解释
+
+首次故障之后，又在 11-17、11-18 复发了三次。这几天的日志把「断线」拆成了两条不同的路径。
+
+### 6.1 路径一：Windows 判定「受限连接」后重置了网卡
+
+11-18 16:17 的完整序列：
+
+```
+16:17:04  校园网 → 热点，连接成功
+16:17:36  NCSI 4042   功能: Internet  更改原因: ActiveHttpProbeFailedButDnsSucceeded
+16:17:36  WLAN-AutoConfig 4003「检测到受限连接，正在尝试自动恢复」
+          恢复类型 4 / 触发原因 5 / IP 系列 0
+16:17:36  Netwtw 8000  Miniport Halt flow (driver disable)
+16:17:37  Netwtw 7010  driver enabled (miniport init)
+16:17:41  重连成功
+```
+
+`ActiveHttpProbeFailedButDnsSucceeded` 是 Windows 自己记录的原因：**DNS 探针成功、HTTP 主动探针失败**。NCSI 据此摘掉该接口的 "Internet" 能力位，WLAN AutoConfig 检测到「受限连接」后执行自动恢复，把 miniport 停用再重新初始化——连接在这一刻断开。
+
+近 3 天 NCSI 判定分布（55 条 4042 事件）：
+
+| 更改原因 | 次数 |
+|---|---|
+| `ActiveHttpProbeSucceeded`（恢复 Internet） | 10 |
+| `ActiveHttpProbeFailedButDnsSucceeded`（摘掉 Internet） | 8 |
+| `ActiveHttpProbeFailed` | 8 |
+| `PassivePacketHops` | 14 |
+
+成功 10 次、失败 16 次。用 `curl` 连续访问探针地址 5 次全部 200，说明并非永久封锁，而是间歇性失败（移动链路短暂卡顿叠加 35 秒超时阈值）。当时配置为 `EnableActiveProbing=1`、`WebTimeout=35`。
+
+### 6.2 路径二：驱动主动断开，没有网卡重置
+
+11-17 的两次：
+
+```
+12:56:14 连接热点 → 13:12:16 断开「网络被驱动程序断开连接」（16 分钟）
+20:25:08 连接热点 → 20:43:32 断开「网络被驱动程序断开连接」（18 分钟）
+```
+
+这两个窗口内**没有 4003、没有 8000 miniport halt**，只有 Netwtw 的 7021 遥测。因此不是 NCSI 触发的恢复，而是驱动判定链路消失——最可能是热点侧停止广播（手机息屏省电 / Android Doze 节流 / 热点空闲超时）。16-18 分钟的间隔与「息屏后进入省电」的节奏相符。
+
+### 6.3 两条路径都能解释「只有一端显示已连接」
+
+| 时刻 | 电脑侧 | 手机侧 | 原因 |
+|---|---|---|---|
+| 网卡被 halt 的 1-3 秒 | 可能仍显示已连接 | 设备消失 | 状态机尚未更新 |
+| AP 停止广播 | 仍显示已连接 | 显示无设备 | 驱动尚未收到 deauth |
+| 重连竞态 | 报「关联时驱动程序已断开」 | 时有时无 | 两侧状态机不同步 |
+
+这也解释了「只有一端连接时仍能访问部分平台」：链路本身是通的，只是 Windows 自我判定「无 Internet」，已建立连接与 DNS 缓存仍在工作。
+
+### 6.4 复发时的路径判定
+
+```powershell
+Get-WinEvent -LogName System -MaxEvents 200 |
+    Where-Object { $_.ProviderName -match 'Netwtw|WLAN' -and $_.Id -in 4003, 8000, 7010 } |
+    Select-Object -First 5 TimeCreated, ProviderName, Id
+```
+
+| 观测 | 路径 | 处理 |
+|---|---|---|
+| 有 `4003` + `8000` | 路径一：NCSI 误判触发自动恢复 | 见 6.5 |
+| 只有 `8003`、无 `4003`/`8000` | 路径二：热点侧断开 | 查手机息屏省电、试 2.4GHz |
+
+### 6.5 针对路径一的处理
+
+```powershell
+# 备份
+reg query "HKLM\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters\Internet" /v EnableActiveProbing
+
+# 关闭主动探测
+reg add "HKLM\SYSTEM\CurrentControlSet\Services\NlaSvc\Parameters\Internet" /v EnableActiveProbing /t REG_DWORD /d 0 /f
+Restart-Service NlaSvc -Force
+
+# 回滚：把 /d 0 改回 /d 1
+```
+
+代价：关闭后 Windows 不再用 HTTP 探针判断连通性，真实断网时界面可能仍显示「已连接」。这是「减少误报、牺牲准确报」的取舍，完全可逆。
+## 7. 已验证有效的手段及其局限
 
 ```powershell
 netsh wlan show profiles
@@ -183,7 +270,20 @@ netsh wlan delete profile name="奕 悟"
 
 **局限**：该操作同时丢弃该 SSID 的缓存租约、重置网卡接口状态、并重新执行完整握手。它有效**不能**用于证明成因是三者中的哪一个。
 
-## 7. 下次复发时的判定步骤
+## 8. 下次复发时的判定步骤
+
+### 第零步：先判断是哪条路径
+
+```powershell
+Get-WinEvent -LogName System -MaxEvents 200 |
+    Where-Object { $_.ProviderName -match 'Netwtw|WLAN' -and $_.Id -in 4003, 8000, 7010 } |
+    Select-Object -First 5 TimeCreated, ProviderName, Id
+```
+
+- 出现 `4003` + `8000` → 路径一，按 6.5 处理；
+- 只有 `8003`、无 `4003`/`8000` → 路径二，查热点侧；
+- 症状是「有 IP 但网关不通」 → 属于第 5 节的候选范围，继续走下面的步骤。
+
 
 ### 第一步：先尝试不换配置修好
 
@@ -221,7 +321,7 @@ pktmon etl2txt C:\Users\Public\wifi.etl -o C:\Users\Public\wifi.txt
 
 `wifi.txt` 中 NIC / NDIS / TCPIP 各组件的计数差异，可区分「帧未到网卡」「到网卡但被丢弃」「到协议栈」。
 
-## 8. 另一件独立的事：第一跳 30% 丢包
+## 9. 另一件独立的事：第一跳 30% 丢包
 
 同一天另一时段，同一台机器连校园网时，到**第一跳网关（2ms）** 测得 30% 丢包：
 
@@ -247,7 +347,7 @@ Set-NetAdapterAdvancedProperty -Name WLAN -RegistryKeyword RoamAggressiveness -R
 
 **局限**：两项同时修改，无法确定是哪一项起作用，也无法排除当时环境自行恢复。
 
-## 9. 排查中做过但无效的操作
+## 10. 排查中做过但无效的操作
 
 | 操作 | 执行后的实测结果 |
 |---|---|
@@ -261,7 +361,7 @@ Set-NetAdapterAdvancedProperty -Name WLAN -RegistryKeyword RoamAggressiveness -R
 | 解绑 VMware Bridge Protocol | 故障依旧 |
 | `IEEE11nMode`：802.11ax → 802.11ac | 未改变结果 |
 
-## 10. 可复用的诊断清单
+## 11. 可复用的诊断清单
 
 ```powershell
 # 1 关联状态与协商参数
@@ -299,16 +399,18 @@ Get-WinEvent -LogName "Microsoft-Windows-WLAN-AutoConfig/Operational" -MaxEvents
 | 有 1003 / 0x79 | DHCP 交换未完成，问题在发送方向 |
 | 第一跳丢包且呈周期性 | 查网卡省电、节能模式、后台扫描 |
 
-## 11. 结论
+## 12. 结论
 
 1. 「已连接但无法上网」不能直接归因于驱动或信号，需要先定位到具体层。
 2. 核心事实：**关联成功、有 IP，但 ARP 表为空、网关不可达、单播计数极低**（16 vs 441）。
 3. **IP 地址来自本地缓存，而非当次 DHCP 交换**（`50066`）。不能把「有地址」当作 DHCP 正常的证据。
 4. 天然对照显示：**缓存有效时失败、缓存过期强制重新申请时成功**。地址分配层因此成为重点怀疑对象。
 5. 删除并重建无线配置在本次故障中有效，但它同时清除了缓存租约、接口状态与握手状态，**不能据此断定成因**。
-6. 三种候选原因均未被证实，第 7 节给出了区分它们的具体步骤。
+6. 三种候选原因均未被证实，第 8 节给出了区分它们的具体步骤。
+7. **周期性掉线这一半已经查清**：或为 NCSI 的 HTTP 探针间歇失败被判「受限连接」，WLAN AutoConfig 自动恢复把网卡 halt 再重初始化（`4003` + `8000` 为证）；或为热点侧停止广播导致驱动主动断开（无 `4003`/`8000`）。
+8. 路径一可用 `EnableActiveProbing=0` 关闭主动探测来消除误判触发的重置，代价是真实断网时界面可能仍显示「已连接」。
 
-## 12. 脚本
+## 13. 脚本
 
 仓库内附 `wifi_hotspot_tool.ps1`，封装上述检查项与常用操作：
 
